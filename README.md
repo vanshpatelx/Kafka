@@ -421,3 +421,137 @@ const startDLQConsumer = async () => {
 
 startDLQConsumer();
 ```
+
+
+
+### Best kafka code
+```typescript
+import { Kafka, Consumer } from 'kafkajs';
+
+const kafka = new Kafka({
+  clientId: 'my-service',
+  brokers: ['kafka-1:9092', 'kafka-2:9093'],
+});
+
+const consumer = kafka.consumer({
+  groupId: 'my-service-group',
+  sessionTimeout: 10000, // Reduce session timeout (default is 60s)
+  heartbeatInterval: 3000, // Send heartbeats every 3s for faster failure detection
+  rebalanceTimeout: 15000, // Reduce rebalance time (default is 60s)
+  retry: { retries: 3 }, // Retry on failures
+});
+
+const run = async () => {
+  await consumer.connect();
+  await consumer.subscribe({ topic: 'my-topic', fromBeginning: true });
+
+  console.log(`Consumer connected and listening for messages...`);
+
+  await consumer.run({
+    eachMessage: async ({ topic, partition, message }) => {
+      console.log(`Received from partition ${partition}:`, message.value?.toString());
+    },
+  });
+};
+
+run().catch(console.error);
+```
+
+
+```typescript
+const consumer = kafka.consumer({
+  groupId: 'my-service-group',
+  groupInstanceId: `instance-${process.env.POD_ID || Math.random()}`,
+});
+```
+```bash
+#!/bin/bash
+
+# Start Kafka broker in the background
+/etc/confluent/docker/run &
+
+# Wait for Kafka to be ready
+echo "Waiting for Kafka to start..."
+while ! nc -z localhost 9092; do   
+  sleep 1
+done
+echo "Kafka started!"
+
+# Check if we should create topics (enabled via ENV)
+if [[ "$ENABLE_TOPIC_CREATION" == "true" ]]; then
+  echo "Creating topics..."
+  kafka-topics.sh --create \
+    --topic my-topic \
+    --bootstrap-server kafka-1:9092,kafka-2:9093 \
+    --partitions 3 \
+    --replication-factor 2 || echo "Topic already exists"
+fi
+
+echo "Kafka setup complete."
+
+# Keep the container running
+wait
+```
+
+```yaml
+version: '3.8'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: zookeeper
+    restart: always
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka-1:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka-1
+    restart: always
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://:9092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:9092
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false" # We disable this and create topics in the entrypoint script
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 2
+      KAFKA_NUM_PARTITIONS: 3
+    volumes:
+      - ./kafka-bootstrap.sh:/scripts/kafka-bootstrap.sh
+    entrypoint: ["/bin/bash", "/scripts/kafka-bootstrap.sh"]
+
+  kafka-2:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka-2
+    restart: always
+    depends_on:
+      - zookeeper
+    ports:
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 2
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://:9093,PLAINTEXT_HOST://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:9093
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 2
+      KAFKA_NUM_PARTITIONS: 3
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    restart: always
+    depends_on:
+      - kafka-1
+      - kafka-2
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAP_SERVERS: kafka-1:9092,kafka-2:9093
+```

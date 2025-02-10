@@ -344,7 +344,7 @@ const consumer = kafka.consumer({
 
 
 ### DLQ Handling
-```
+```typescript
 import { Kafka } from "kafkajs";
 
 const kafka = new Kafka({ clientId: "dlq-consumer", brokers: ["kafka:9092"] });
@@ -400,7 +400,7 @@ const startConsumer = async () => {
 
 startConsumer();
 ```
-```
+```typescript
 const dlqConsumer = kafka.consumer({ groupId: "dlq-consumer-group" });
 
 const processDLQMessage = async (message: string) => {

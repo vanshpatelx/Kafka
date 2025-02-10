@@ -281,3 +281,143 @@ startConsumer();
 | **Multiple Publishers with Different Producer Groups** | **Different producer groups, same topic** | Single consumer group | Fan-in pattern (multi-source to one consumer) |
 
 ✅ **Kafka is highly flexible! You can safely scale publishers and decide whether to use one or multiple consumer groups.**  
+
+
+3️⃣ Key Features of This Implementation
+
+Issue	Solution
+Pod crashes?	Kafka assigns its partitions to another pod.
+Pod restarts?	Kafka rebalances partitions across all available pods.
+Prevent duplicate processing?	Offsets are committed manually after successful processing.
+Ensure smooth rebalance?	heartbeat() keeps Kafka informed that the consumer is alive.
+
+
+```typescript
+const kafka = new Kafka({ clientId: "db-server", brokers: ["kafka:9092"] });
+const consumer = kafka.consumer({ groupId: "db-server-group" });
+
+const startConsumer = async () => {
+    await consumer.connect();
+    await consumer.subscribe({ topic: "auth.registered", fromBeginning: false });
+
+    await consumer.run({
+        eachMessage: async ({ topic, partition, message, heartbeat, commitOffsetsIfNecessary }) => {
+            try {
+                console.log(`Processing message from partition ${partition}: ${message.value}`);
+
+                // ✅ Process message (business logic)
+                await processMessage(JSON.parse(message.value?.toString() || "{}"));
+
+                // ✅ Commit offsets so Kafka knows this message was processed
+                await commitOffsetsIfNecessary([{ topic, partition, offset: (Number(message.offset) + 1).toString() }]);
+
+                // ✅ Keep the connection alive (prevents unnecessary rebalancing)
+                await heartbeat();
+            } catch (error) {
+                console.error(`Error processing message: ${error.message}`);
+                await handleFailedMessage(message);
+            }
+        },
+    });
+
+    consumer.on("consumer.group_rebalance", async () => {
+        console.log("Kafka is rebalancing, partitions will be reassigned...");
+    });
+};
+
+startConsumer();
+```
+4️⃣ What If a Pod Comes Back Online Too Quickly?
+
+💡 Problem: If a pod flaps (crashes & comes back rapidly), Kafka might rebalance too frequently, causing unnecessary downtime.
+✅ Solution: Use session.timeout.ms and max.poll.interval.ms to delay immediate rebalancing.
+
+Modify consumer settings:
+```typescript
+const consumer = kafka.consumer({
+    groupId: "db-server-group",
+    sessionTimeout: 30000,  // 30 seconds before marking pod as dead
+    maxPollInterval: 60000  // 60 seconds allowed between processing messages
+});
+```
+📌 This prevents Kafka from rebalancing too quickly if a pod restarts within 30 seconds.
+
+
+### DLQ Handling
+```
+import { Kafka } from "kafkajs";
+
+const kafka = new Kafka({ clientId: "dlq-consumer", brokers: ["kafka:9092"] });
+const consumer = kafka.consumer({ groupId: "auth-consumer-group" });
+const dlqProducer = kafka.producer();
+
+const MAX_RETRIES = 3;
+const failedMessages: Map<string, number> = new Map();  // Track retry attempts
+
+const processMessage = async (message: string) => {
+    // Simulate processing failure for some messages
+    if (Math.random() < 0.3) throw new Error("Processing Failed");
+    console.log(`✅ Successfully processed: ${message}`);
+};
+
+const sendToDLQ = async (message: string) => {
+    await dlqProducer.connect();
+    await dlqProducer.send({
+        topic: "dlq.auth.registered",
+        messages: [{ value: message }],
+    });
+    console.log(`🚨 Moved to DLQ: ${message}`);
+};
+
+const startConsumer = async () => {
+    await consumer.connect();
+    await consumer.subscribe({ topic: "auth.registered", fromBeginning: false });
+
+    await consumer.run({
+        eachMessage: async ({ topic, partition, message }) => {
+            const msgValue = message.value?.toString() || "{}";
+
+            try {
+                console.log(`Processing: ${msgValue}`);
+                await processMessage(msgValue);
+                failedMessages.delete(msgValue);  // Reset retry count if success
+            } catch (error) {
+                console.error(`❌ Error processing: ${msgValue}`);
+
+                // Track retries
+                const retries = failedMessages.get(msgValue) || 0;
+                if (retries >= MAX_RETRIES) {
+                    await sendToDLQ(msgValue);  // Move to DLQ
+                    failedMessages.delete(msgValue);
+                } else {
+                    failedMessages.set(msgValue, retries + 1);
+                    console.log(`🔁 Retrying (${retries + 1}/${MAX_RETRIES})`);
+                }
+            }
+        },
+    });
+};
+
+startConsumer();
+```
+```
+const dlqConsumer = kafka.consumer({ groupId: "dlq-consumer-group" });
+
+const processDLQMessage = async (message: string) => {
+    console.log(`🔄 Reprocessing from DLQ: ${message}`);
+};
+
+const startDLQConsumer = async () => {
+    await dlqConsumer.connect();
+    await dlqConsumer.subscribe({ topic: "dlq.auth.registered", fromBeginning: false });
+
+    await dlqConsumer.run({
+        eachMessage: async ({ message }) => {
+            const msgValue = message.value?.toString() || "{}";
+            await processDLQMessage(msgValue);
+        },
+    });
+};
+
+startDLQConsumer();
+```
